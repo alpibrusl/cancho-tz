@@ -1,0 +1,243 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import tz;
+import tz_io;
+
+// Conformance: every vector in a file made by scripts/gen_vectors.py from CPython's zoneinfo, replayed against `tz`
+// reading the same zoneinfo files. `cancho test` cannot run it (a test has no Fs), so it is a program:
+//
+//     zones_all <zoneinfo dir> <vectors file>
+//
+// It prints the first mismatches in full, then a summary, and exits 0 only if there were none. The oracle is another
+// implementation of the same standard reading the same bytes: agreement on over half a million instants (every transition,
+// one second either side, every daylight-time change out to 2099, and wall-clock times through every gap and fold) is
+// strong evidence; it is not a proof, and it shares tzdata's own errors by construction.
+
+fn say[&i, &t](io: &!i Io, text: &t [byte]) -> [io_write] int {
+    return io.write_all(io, text);
+}
+
+fn number[&h, &i](heap: &!h Heap, io: &!i Io, n: int) -> [heap, io_write] int {
+    var b = buffer.empty(heap, 24);
+    if n < 0 {
+        b = buffer.push(heap, b, byte_of('-'));
+        b = buffer.push_nat(heap, b, 0 - n);
+    } else {
+        b = buffer.push_nat(heap, b, n);
+    }
+    borrow b as &r in {
+        io.write_all(io, buffer.bytes(r));
+    }
+    return buffer.drop(heap, b);
+}
+
+// Read a whole file.
+fn read_all[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
+    var out = buffer.empty(heap, 1048576);
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            return (out, e);
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var errno = 0;
+            let piece = box_slice(heap, 65536, byte_of(0));
+            var more = true;
+            borrow mut file as &!x in {
+                borrow mut piece as &!pw in {
+                    while more {
+                        match file_read(x, contents(pw)) {
+                            Read::Got(n) => {
+                                out = buffer.append(heap, out, contents(pw)[0..n]);
+                            }
+                            Read::End => {
+                                more = false;
+                            }
+                            Read::Failed(e) => {
+                                errno = e;
+                                more = false;
+                            }
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, piece);
+            file_close(file);
+            return (out, errno);
+        }
+    }
+}
+
+// The `n`th space-separated field of `line` as a range (start, end); (0, 0) if absent.
+fn field[&l](line: &l [byte], n: int) -> [] (int, int) {
+    var i = 0;
+    var seen = 0;
+    var start = 0;
+    while i <= len(line) {
+        if i == len(line) || int_of(line[i]) == 32 {
+            if seen == n {
+                return (start, i);
+            }
+            seen = seen + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return (0, 0);
+}
+
+fn int_in[&l](line: &l [byte], n: int) -> [] int {
+    let (s, e) = field(line, n);
+    var i = s;
+    var neg = false;
+    if i < e && int_of(line[i]) == 45 {
+        neg = true;
+        i = i + 1;
+    }
+    var v = 0;
+    while i < e {
+        v = v * 10 + (int_of(line[i]) - 48);
+        i = i + 1;
+    }
+    if neg {
+        return 0 - v;
+    }
+    return v;
+}
+
+fn run[&h, &f, &i](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &static [byte], vectors_path: &static [byte]) -> [heap, fs_read(""), file_read, io_write] int {
+    let (all, errno) = read_all(heap, fs, vectors_path);
+    if errno != 0 {
+        buffer.drop(heap, all);
+        say(io, "cannot read the vectors file\n");
+        return 2;
+    }
+    var mismatches = 0;
+    var o_count = 0;
+    var l_count = 0;
+    var zones = 0;
+    var load_failures = 0;
+    var current = buffer.empty(heap, 64);
+    let (z0, c0) = tz.load(buffer.empty(heap, 1));
+    var zone = z0;
+    var zone_ok = false;
+    borrow all as &ab in {
+        let text = buffer.bytes(ab);
+        var pos = 0;
+        while pos < len(text) {
+            var e = pos;
+            while e < len(text) && int_of(text[e]) != 10 {
+                e = e + 1;
+            }
+            let line = text[pos..e];
+            pos = e + 1;
+            if len(line) > 4 {
+                let (zs, ze) = field(line, 1);
+                let name = line[zs..ze];
+                var same = false;
+                borrow current as &cb in {
+                    same = bytes.equal(buffer.bytes(cb), name);
+                }
+                if !same {
+                    tz.drop(heap, zone);
+                    buffer.drop(heap, current);
+                    current = buffer.append(heap, buffer.empty(heap, 32), name);
+                    let (z2, c2) = tz_io.read_zone_in(heap, fs, dir, name);
+                    zone = z2;
+                    zone_ok = c2 == 0;
+                    zones = zones + 1;
+                    if !zone_ok {
+                        load_failures = load_failures + 1;
+                        say(io, "LOAD FAILED ");
+                        say(io, name);
+                        say(io, " code ");
+                        number(heap, io, c2);
+                        say(io, "\n");
+                    }
+                }
+                if zone_ok {
+                    var bad = false;
+                    borrow zone as &zz in {
+                        if int_of(line[0]) == 79 {
+                            o_count = o_count + 1;
+                            let t = int_in(line, 2);
+                            let info = tz.info_at(zz, t);
+                            let (as_, ae) = field(line, 5);
+                            if info.utoff != int_in(line, 3) || info.isdst != int_in(line, 4) || !bytes.equal(tz.abbreviation(zz, info), line[as_..ae]) {
+                                bad = true;
+                            }
+                        } else {
+                            l_count = l_count + 1;
+                            let r = tz.local_to_utc(zz, int_in(line, 2));
+                            if r.kind != int_in(line, 3) || r.first != int_in(line, 4) || r.second != int_in(line, 5) {
+                                bad = true;
+                            }
+                        }
+                    }
+                    if bad {
+                        mismatches = mismatches + 1;
+                        if mismatches <= 25 {
+                            say(io, "MISMATCH ");
+                            say(io, line);
+                            say(io, "\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tz.drop(heap, zone);
+    buffer.drop(heap, current);
+    buffer.drop(heap, all);
+    say(io, "zones ");
+    number(heap, io, zones);
+    say(io, "  offset vectors ");
+    number(heap, io, o_count);
+    say(io, "  local vectors ");
+    number(heap, io, l_count);
+    say(io, "  load failures ");
+    number(heap, io, load_failures);
+    say(io, "  mismatches ");
+    number(heap, io, mismatches);
+    say(io, "\n");
+    if mismatches == 0 && load_failures == 0 && zones > 0 {
+        say(io, "ok\n");
+        return 0;
+    }
+    say(io, "FAIL\n");
+    return 1;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow mut console as &!i in {
+            borrow mut memory as &!h in {
+                borrow args as &g in {
+                    if arg_count(g) == 3 {
+                        status = run(h, f, i, arg(g, 1), arg(g, 2));
+                    } else {
+                        io.error_all(i, "usage: zones_all <zoneinfo dir> <vectors file>\n");
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

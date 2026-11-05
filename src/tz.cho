@@ -1,0 +1,685 @@
+edition 5;
+
+module tz;
+
+import std.buffer;
+
+// `tz` -- IANA time zones for cancho. It reads a zone from the bytes of a TZif file (RFC 8536, version 2 or later: the
+// files in /usr/share/zoneinfo) and answers the two questions a travel system has:
+//
+//   * what is the offset from UTC in this zone at this instant? (`info_at`, `to_local`)
+//   * what instant is this wall-clock time in this zone? (`local_to_utc`), which is NOT a function: a clock time can
+//     happen twice (when clocks go back) or never (when they go forward), and the answer says which.
+//
+// The package performs no I/O and holds no capability: the caller reads the file (`tz_io` does it for
+// /usr/share/zoneinfo, narrowed to that directory) or embeds the bytes. A zone is kept as the bytes themselves, with
+// the offsets of its tables; nothing is decoded until asked for.
+//
+// Time is SECONDS since 1970-01-01 00:00:00 UTC for an instant (`utc`), and SECONDS since the same moment on the zone's
+// wall clock for a local time (`local`, "naive": it is only meaningful together with a zone). Seconds, because
+// historical offsets have them (Madrid was UTC-0:14:44 before 1901) and because the file's own resolution is a second.
+// `minutes_*` are the same in minutes for callers that count minutes (floor division, so a negative time is exact).
+//
+// After the last explicit transition in the file the answer comes from the POSIX TZ rule string at the end of the file
+// (e.g. "CET-1CEST,M3.5.0,M10.5.0/3"). That is what a date in 2040 uses, and why the rule evaluator is not optional.
+// Only the `Mm.w.d[/time]` form of a rule is supported, which is every rule in tzdata 2026e (checked over all 599
+// files); a file whose rule uses another form is refused (`r_bad_rule`), never guessed at.
+//
+// Before the first transition the zone's first local time type is used (RFC 8536), which for almost every zone is its
+// local mean time. Leap-second records are skipped, not applied (POSIX time has none).
+
+// Refusal codes of `load`.
+pub fn ok() -> [] int {
+    return 0;
+}
+
+// Does not start with "TZif".
+pub fn r_not_tzif() -> [] int {
+    return 1;
+}
+
+// A version 1 file: 32-bit times and no rule string. Not supported.
+pub fn r_old_version() -> [] int {
+    return 2;
+}
+
+// The file is shorter than its own counts say.
+pub fn r_truncated() -> [] int {
+    return 3;
+}
+
+// A count that makes no sense (no local time types, a time type index outside the table).
+pub fn r_bad_counts() -> [] int {
+    return 4;
+}
+
+// The rule string at the end is malformed or uses a form this package does not support.
+pub fn r_bad_rule() -> [] int {
+    return 5;
+}
+
+// How a wall-clock time maps to instants (`Local.kind`).
+pub fn k_unique() -> [] int {
+    return 0;
+}
+
+// The clock showed this time twice: `first` is the earlier instant, `second` the later.
+pub fn k_ambiguous() -> [] int {
+    return 1;
+}
+
+// The clock never showed this time (it jumped over it): `first` reads it with the offset in force before the jump,
+// `second` with the offset after. These are the two readings Python's `fold=0` and `fold=1` give.
+pub fn k_gap() -> [] int {
+    return 2;
+}
+
+// ---------------------------------------------------------------------
+// Calendar
+// ---------------------------------------------------------------------
+
+// Days from 1970-01-01 to the civil date (Howard Hinnant's algorithm). Exact for any year, negative days included.
+pub fn days_from_civil(y: int, m: int, d: int) -> [] int {
+    var year = y;
+    if m <= 2 {
+        year = year - 1;
+    }
+    var era = year / 400;
+    if year < 0 && year % 400 != 0 {
+        era = era - 1;
+    }
+    let yoe = year - era * 400;
+    var shifted = m - 3;
+    if m <= 2 {
+        shifted = m + 9;
+    }
+    let doy = (153 * shifted + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// The civil year that epoch day `days` falls in.
+pub fn year_of_days(days: int) -> [] int {
+    let z = days + 719468;
+    var era = z / 146097;
+    if z < 0 && z % 146097 != 0 {
+        era = era - 1;
+    }
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    var month = mp + 3;
+    if mp >= 10 {
+        month = mp - 9;
+    }
+    var year = yoe + era * 400;
+    if month <= 2 {
+        year = year + 1;
+    }
+    return year;
+}
+
+pub fn is_leap(y: int) -> [] bool {
+    return y % 4 == 0 && y % 100 != 0 || y % 400 == 0;
+}
+
+pub fn days_in_month(y: int, m: int) -> [] int {
+    if m == 2 {
+        if is_leap(y) {
+            return 29;
+        }
+        return 28;
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30;
+    }
+    return 31;
+}
+
+// Floor division and remainder, so that a negative time is exact.
+pub fn floor_div(a: int, b: int) -> [] int {
+    var q = a / b;
+    if a % b != 0 && a < 0 != b < 0 {
+        q = q - 1;
+    }
+    return q;
+}
+
+// The weekday of epoch day `days`: 0 Sunday .. 6 Saturday (1970-01-01 was a Thursday).
+pub fn weekday_of_days(days: int) -> [] int {
+    var w = (days + 4) % 7;
+    if w < 0 {
+        w = w + 7;
+    }
+    return w;
+}
+
+// The epoch day of the `week`th `weekday` of month `m` of year `y`; week 5 means the last one. Weekday 0 is Sunday.
+pub fn nth_weekday(y: int, m: int, week: int, weekday: int) -> [] int {
+    let first = days_from_civil(y, m, 1);
+    let shift = (weekday - weekday_of_days(first) + 7) % 7;
+    var day = 1 + shift + (week - 1) * 7;
+    if day > days_in_month(y, m) {
+        day = day - 7;
+    }
+    return first + day - 1;
+}
+
+// ---------------------------------------------------------------------
+// Bytes
+// ---------------------------------------------------------------------
+
+fn u8[&b](data: &b [byte], at: int) -> [] int {
+    return int_of(data[at]);
+}
+
+// A big-endian signed 32-bit integer.
+fn be32[&b](data: &b [byte], at: int) -> [] int {
+    let v = u8(data, at) << 24 | u8(data, at + 1) << 16 | u8(data, at + 2) << 8 | u8(data, at + 3);
+    if v >= 2147483648 {
+        return v - 4294967296;
+    }
+    return v;
+}
+
+fn ube32[&b](data: &b [byte], at: int) -> [] int {
+    return u8(data, at) << 24 | u8(data, at + 1) << 16 | u8(data, at + 2) << 8 | u8(data, at + 3);
+}
+
+// A big-endian signed 64-bit integer, built from two halves so that no intermediate leaves the range of an int.
+fn be64[&b](data: &b [byte], at: int) -> [] int {
+    return be32(data, at) * 4294967296 + ube32(data, at + 4);
+}
+
+// ---------------------------------------------------------------------
+// The POSIX rule string
+// ---------------------------------------------------------------------
+
+// A parsed rule such as "CET-1CEST,M3.5.0,M10.5.0/3". Offsets are seconds EAST of UTC (the opposite sign to the string's
+// own). `has_dst` is 0 for a zone with no daylight time ("JST-9"). A transition is "the `w`th weekday `d` of month
+// `m` at `t` seconds after local midnight" (Sunday is 0; week 5 is the last; `t` may be negative or beyond a day).
+pub struct Rule {
+    present: int,
+    std_off: int,
+    dst_off: int,
+    has_dst: int,
+    sm: int,
+    sw: int,
+    sd: int,
+    st: int,
+    em: int,
+    ew: int,
+    ed: int,
+    et: int,
+    std_name_at: int,
+    std_name_len: int,
+    dst_name_at: int,
+    dst_name_len: int,
+}
+
+fn no_rule() -> [] Rule {
+    return Rule { present: 0, std_off: 0, dst_off: 0, has_dst: 0, sm: 0, sw: 0, sd: 0, st: 0, em: 0, ew: 0, ed: 0, et: 0, std_name_at: 0, std_name_len: 0, dst_name_at: 0, dst_name_len: 0 };
+}
+
+fn is_alpha(c: int) -> [] bool {
+    return c >= 65 && c <= 90 || c >= 97 && c <= 122;
+}
+
+fn is_digit(c: int) -> [] bool {
+    return c >= 48 && c <= 57;
+}
+
+// A zone name at `pos`: three or more letters, or anything but '>' between '<' and '>'. (start, length, next position,
+// good).
+fn rule_name[&b](data: &b [byte], pos: int, end: int) -> [] (int, int, int, bool) {
+    if pos >= end {
+        return (0, 0, pos, false);
+    }
+    if u8(data, pos) == 60 {
+        var i = pos + 1;
+        while i < end && u8(data, i) != 62 {
+            i = i + 1;
+        }
+        if i >= end || i == pos + 1 {
+            return (0, 0, pos, false);
+        }
+        return (pos + 1, i - pos - 1, i + 1, true);
+    }
+    var i = pos;
+    while i < end && is_alpha(u8(data, i)) {
+        i = i + 1;
+    }
+    if i - pos < 3 {
+        return (0, 0, pos, false);
+    }
+    return (pos, i - pos, i, true);
+}
+
+// A signed time `[+-]hh[:mm[:ss]]` at `pos` in seconds; hours up to 167 (tzdata uses hours beyond 24 for some rules).
+// (seconds, next position, good).
+fn rule_time[&b](data: &b [byte], pos: int, end: int) -> [] (int, int, bool) {
+    var i = pos;
+    var sign = 1;
+    if i < end && (u8(data, i) == 43 || u8(data, i) == 45) {
+        if u8(data, i) == 45 {
+            sign = 0 - 1;
+        }
+        i = i + 1;
+    }
+    var hours = 0;
+    var digits = 0;
+    while i < end && is_digit(u8(data, i)) && digits < 3 {
+        hours = hours * 10 + (u8(data, i) - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 || hours > 167 {
+        return (0, pos, false);
+    }
+    var total = hours * 3600;
+    var part = 0;
+    while part < 2 && i < end && u8(data, i) == 58 {
+        i = i + 1;
+        var v = 0;
+        var n = 0;
+        while i < end && is_digit(u8(data, i)) && n < 2 {
+            v = v * 10 + (u8(data, i) - 48);
+            n = n + 1;
+            i = i + 1;
+        }
+        if n == 0 || v > 59 {
+            return (0, pos, false);
+        }
+        if part == 0 {
+            total = total + v * 60;
+        } else {
+            total = total + v;
+        }
+        part = part + 1;
+    }
+    return (sign * total, i, true);
+}
+
+// `Mm.w.d[/time]` at `pos`: (month, week, weekday, time, next position, good).
+fn rule_date[&b](data: &b [byte], pos: int, end: int) -> [] (int, int, int, int, int, bool) {
+    let bad = (0, 0, 0, 0, pos, false);
+    if pos >= end || u8(data, pos) != 77 {
+        return bad;
+    }
+    var i = pos + 1;
+    var m = 0;
+    var n = 0;
+    while i < end && is_digit(u8(data, i)) && n < 2 {
+        m = m * 10 + (u8(data, i) - 48);
+        n = n + 1;
+        i = i + 1;
+    }
+    if n == 0 || m < 1 || m > 12 || i >= end || u8(data, i) != 46 {
+        return bad;
+    }
+    i = i + 1;
+    if i >= end || !is_digit(u8(data, i)) {
+        return bad;
+    }
+    let w = u8(data, i) - 48;
+    i = i + 1;
+    if w < 1 || w > 5 || i >= end || u8(data, i) != 46 {
+        return bad;
+    }
+    i = i + 1;
+    if i >= end || !is_digit(u8(data, i)) {
+        return bad;
+    }
+    let d = u8(data, i) - 48;
+    i = i + 1;
+    if d > 6 {
+        return bad;
+    }
+    var t = 7200;
+    if i < end && u8(data, i) == 47 {
+        let (secs, next, good) = rule_time(data, i + 1, end);
+        if !good {
+            return bad;
+        }
+        t = secs;
+        i = next;
+    }
+    return (m, w, d, t, i, true);
+}
+
+// Parse the rule string `data[start..end]` (without its newlines). An empty string is "no rule" (present = 0).
+fn parse_rule[&b](data: &b [byte], start: int, end: int) -> [] (Rule, bool) {
+    if end <= start {
+        return (no_rule(), true);
+    }
+    let (sn_at, sn_len, p1, g1) = rule_name(data, start, end);
+    if !g1 {
+        return (no_rule(), false);
+    }
+    let (std_west, p2, g2) = rule_time(data, p1, end);
+    if !g2 {
+        return (no_rule(), false);
+    }
+    let std_off = 0 - std_west;
+    if p2 >= end {
+        return (Rule { present: 1, std_off: std_off, dst_off: std_off, has_dst: 0, sm: 0, sw: 0, sd: 0, st: 0, em: 0, ew: 0, ed: 0, et: 0, std_name_at: sn_at, std_name_len: sn_len, dst_name_at: 0, dst_name_len: 0 }, true);
+    }
+    let (dn_at, dn_len, p3, g3) = rule_name(data, p2, end);
+    if !g3 {
+        return (no_rule(), false);
+    }
+    var dst_off = std_off + 3600;
+    var p4 = p3;
+    if p4 < end && u8(data, p4) != 44 {
+        let (dst_west, next, good) = rule_time(data, p4, end);
+        if !good {
+            return (no_rule(), false);
+        }
+        dst_off = 0 - dst_west;
+        p4 = next;
+    }
+    if p4 >= end || u8(data, p4) != 44 {
+        return (no_rule(), false);
+    }
+    let (sm, sw, sd, st, p5, g5) = rule_date(data, p4 + 1, end);
+    if !g5 || p5 >= end || u8(data, p5) != 44 {
+        return (no_rule(), false);
+    }
+    let (em, ew, ed, et, p6, g6) = rule_date(data, p5 + 1, end);
+    if !g6 || p6 != end {
+        return (no_rule(), false);
+    }
+    return (Rule { present: 1, std_off: std_off, dst_off: dst_off, has_dst: 1, sm: sm, sw: sw, sd: sd, st: st, em: em, ew: ew, ed: ed, et: et, std_name_at: sn_at, std_name_len: sn_len, dst_name_at: dn_at, dst_name_len: dn_len }, true);
+}
+
+// ---------------------------------------------------------------------
+// A zone
+// ---------------------------------------------------------------------
+
+// A zone: the file's bytes and where its tables are (all offsets are into `data`). Version 2+ data only.
+pub res struct Zone {
+    data: buffer.Buffer,
+    timecnt: int,
+    typecnt: int,
+    p_times: int,
+    p_idx: int,
+    p_types: int,
+    p_chars: int,
+    charcnt: int,
+    rule: Rule,
+}
+
+// What is true of a zone at an instant: the offset east of UTC in seconds, whether it is daylight time, and the
+// abbreviation as a range of `Zone.data` (`abbreviation` turns it into bytes).
+pub struct Info {
+    utoff: int,
+    isdst: int,
+    name_at: int,
+    name_len: int,
+}
+
+// A wall-clock time read in a zone. `kind` is `k_unique`, `k_ambiguous` or `k_gap`. `first` and `second` are instants
+// in seconds; they are equal for a unique time.
+pub struct Local {
+    kind: int,
+    first: int,
+    second: int,
+}
+
+pub fn drop[&h](heap: &!h Heap, z: Zone) -> [heap] int {
+    let Zone { data, timecnt, typecnt, p_times, p_idx, p_types, p_chars, charcnt, rule } = z;
+    return buffer.drop(heap, data);
+}
+
+// The end of the first (version 1) data block that starts after the header at `at`.
+fn v1_block_size[&b](data: &b [byte], at: int) -> [] int {
+    let isutcnt = ube32(data, at + 20);
+    let isstdcnt = ube32(data, at + 24);
+    let leapcnt = ube32(data, at + 28);
+    let timecnt = ube32(data, at + 32);
+    let typecnt = ube32(data, at + 36);
+    let charcnt = ube32(data, at + 40);
+    return timecnt * 4 + timecnt + typecnt * 6 + charcnt + leapcnt * 8 + isstdcnt + isutcnt;
+}
+
+// Read a zone from the bytes of a TZif file. Takes the bytes and keeps them. Answers the zone and 0, or an empty zone
+// and a refusal.
+pub fn load(file: buffer.Buffer) -> [] (Zone, int) {
+    var code = ok();
+    var size = 0;
+    borrow file as &sb in {
+        size = buffer.size(sb);
+    }
+    var timecnt = 0;
+    var typecnt = 0;
+    var charcnt = 0;
+    var p_times = 0;
+    var p_idx = 0;
+    var p_types = 0;
+    var p_chars = 0;
+    var rule = no_rule();
+    if size < 44 {
+        code = r_not_tzif();
+    } else {
+        borrow file as &db in {
+            let b = buffer.bytes(db);
+            if u8(b, 0) != 84 || u8(b, 1) != 90 || u8(b, 2) != 105 || u8(b, 3) != 102 {
+                code = r_not_tzif();
+            } else if u8(b, 4) < 50 {
+                code = r_old_version();
+            } else {
+                // The version 2 header follows the whole version 1 block.
+                let h2 = 44 + v1_block_size(b, 0);
+                if h2 + 44 > size {
+                    code = r_truncated();
+                } else if u8(b, h2) != 84 || u8(b, h2 + 1) != 90 || u8(b, h2 + 2) != 105 || u8(b, h2 + 3) != 102 {
+                    code = r_not_tzif();
+                } else {
+                    let isutcnt = ube32(b, h2 + 20);
+                    let isstdcnt = ube32(b, h2 + 24);
+                    let leapcnt = ube32(b, h2 + 28);
+                    timecnt = ube32(b, h2 + 32);
+                    typecnt = ube32(b, h2 + 36);
+                    charcnt = ube32(b, h2 + 40);
+                    let body = h2 + 44;
+                    p_times = body;
+                    p_idx = p_times + timecnt * 8;
+                    p_types = p_idx + timecnt;
+                    p_chars = p_types + typecnt * 6;
+                    let after = p_chars + charcnt + leapcnt * 12 + isstdcnt + isutcnt;
+                    if typecnt < 1 || charcnt < 1 {
+                        code = r_bad_counts();
+                    } else if after > size {
+                        code = r_truncated();
+                    } else {
+                        // Every transition's type index and every abbreviation index must be inside its table.
+                        var i = 0;
+                        while i < timecnt {
+                            if u8(b, p_idx + i) >= typecnt {
+                                code = r_bad_counts();
+                            }
+                            i = i + 1;
+                        }
+                        var k = 0;
+                        while k < typecnt {
+                            if u8(b, p_types + k * 6 + 5) >= charcnt {
+                                code = r_bad_counts();
+                            }
+                            k = k + 1;
+                        }
+                        // The footer: '\n' rule '\n'.
+                        if code == 0 && after < size {
+                            if u8(b, after) != 10 {
+                                code = r_bad_rule();
+                            } else {
+                                var e = after + 1;
+                                while e < size && u8(b, e) != 10 {
+                                    e = e + 1;
+                                }
+                                let (parsed, good) = parse_rule(b, after + 1, e);
+                                if !good {
+                                    code = r_bad_rule();
+                                } else {
+                                    rule = parsed;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return (Zone { data: file, timecnt: timecnt, typecnt: typecnt, p_times: p_times, p_idx: p_idx, p_types: p_types, p_chars: p_chars, charcnt: charcnt, rule: rule }, code);
+}
+
+// ---------------------------------------------------------------------
+// Offsets
+// ---------------------------------------------------------------------
+
+// How many explicit transitions the file lists.
+pub fn transitions[&v](z: &v Zone) -> [] int {
+    return z.timecnt;
+}
+
+// The instant of explicit transition `i`, in seconds.
+pub fn transition_at[&v](z: &v Zone, i: int) -> [] int {
+    return be64(buffer.bytes(z.data), z.p_times + i * 8);
+}
+
+// The local time type `k` as an Info.
+fn type_info[&v](z: &v Zone, k: int) -> [] Info {
+    let b = buffer.bytes(z.data);
+    let at = z.p_types + k * 6;
+    let abbr = u8(b, at + 5);
+    var len_ = 0;
+    while z.p_chars + abbr + len_ < z.p_chars + z.charcnt && u8(b, z.p_chars + abbr + len_) != 0 {
+        len_ = len_ + 1;
+    }
+    return Info { utoff: be32(b, at), isdst: u8(b, at + 4), name_at: z.p_chars + abbr, name_len: len_ };
+}
+
+// The start of daylight time in `year`, as an instant: the rule's start is wall-clock STANDARD time.
+fn rule_start(r: Rule, year: int) -> [] int {
+    return nth_weekday(year, r.sm, r.sw, r.sd) * 86400 + r.st - r.std_off;
+}
+
+// The end of daylight time in `year`: the rule's end is wall-clock DAYLIGHT time.
+fn rule_end(r: Rule, year: int) -> [] int {
+    return nth_weekday(year, r.em, r.ew, r.ed) * 86400 + r.et - r.dst_off;
+}
+
+fn rule_info(r: Rule, t: int) -> [] Info {
+    let std = Info { utoff: r.std_off, isdst: 0, name_at: r.std_name_at, name_len: r.std_name_len };
+    if r.has_dst == 0 {
+        return std;
+    }
+    let dst = Info { utoff: r.dst_off, isdst: 1, name_at: r.dst_name_at, name_len: r.dst_name_len };
+    let year = year_of_days(floor_div(t + r.std_off, 86400));
+    let s = rule_start(r, year);
+    let e = rule_end(r, year);
+    if s < e {
+        if s <= t && t < e {
+            return dst;
+        }
+        return std;
+    }
+    // Southern hemisphere: daylight time spans the new year.
+    if e <= t && t < s {
+        return std;
+    }
+    return dst;
+}
+
+// What is true in `z` at the instant `t` (seconds since the epoch, UTC).
+pub fn info_at[&v](z: &v Zone, t: int) -> [] Info {
+    if z.timecnt == 0 {
+        if z.rule.present == 1 {
+            return rule_info(z.rule, t);
+        }
+        return type_info(z, 0);
+    }
+    let b = buffer.bytes(z.data);
+    if t < be64(b, z.p_times) {
+        return type_info(z, 0);
+    }
+    if t >= be64(b, z.p_times + (z.timecnt - 1) * 8) && z.rule.present == 1 {
+        return rule_info(z.rule, t);
+    }
+    // The last transition at or before t.
+    var lo = 0;
+    var hi = z.timecnt - 1;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if be64(b, z.p_times + mid * 8) <= t {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return type_info(z, u8(b, z.p_idx + lo));
+}
+
+// The offset east of UTC, in seconds, in `z` at instant `t`.
+pub fn offset_at[&v](z: &v Zone, t: int) -> [] int {
+    return info_at(z, t).utoff;
+}
+
+// The wall-clock reading of instant `t` in `z`, in seconds.
+pub fn to_local[&v](z: &v Zone, t: int) -> [] int {
+    return t + offset_at(z, t);
+}
+
+// The abbreviation ("CET", "CEST", "+0530") of an Info, borrowed from the zone.
+pub fn abbreviation[&v](z: &v Zone, i: Info) -> [] &v [byte] {
+    let b = buffer.bytes(z.data);
+    return b[i.name_at..i.name_at + i.name_len];
+}
+
+// The instants at which the wall-clock time `local` (seconds, naive) happens in `z`. It happens once, twice or never:
+// see `k_unique`, `k_ambiguous`, `k_gap`. The offsets are looked at a day either side, so two changes of offset less than
+// a day apart are not told apart (none exists in tzdata 2026e; the conformance run checks every zone).
+pub fn local_to_utc[&v](z: &v Zone, local: int) -> [] Local {
+    let before = offset_at(z, local - 86400);
+    let after = offset_at(z, local + 86400);
+    let u1 = local - before;
+    let u2 = local - after;
+    let ok1 = offset_at(z, u1) == before;
+    if before == after {
+        // One offset on both sides. Unless it changes twice within the window, the time exists exactly once.
+        return Local { kind: k_unique(), first: u1, second: u1 };
+    }
+    let ok2 = offset_at(z, u2) == after;
+    if ok1 && ok2 {
+        var lo = u1;
+        var hi = u2;
+        if u2 < u1 {
+            lo = u2;
+            hi = u1;
+        }
+        return Local { kind: k_ambiguous(), first: lo, second: hi };
+    }
+    if ok1 {
+        return Local { kind: k_unique(), first: u1, second: u1 };
+    }
+    if ok2 {
+        return Local { kind: k_unique(), first: u2, second: u2 };
+    }
+    return Local { kind: k_gap(), first: u1, second: u2 };
+}
+
+// ---------------------------------------------------------------------
+// Minutes
+// ---------------------------------------------------------------------
+
+// `local_to_utc` for a caller that counts minutes: `local` is minutes of wall-clock time since the epoch; the result's
+// instants are minutes UTC, rounded down (an offset with seconds, found only in historical zones, makes this inexact).
+pub fn minutes_local_to_utc[&v](z: &v Zone, local: int) -> [] Local {
+    let r = local_to_utc(z, local * 60);
+    return Local { kind: r.kind, first: floor_div(r.first, 60), second: floor_div(r.second, 60) };
+}
+
+// The wall-clock minutes of the instant `utc` (minutes UTC).
+pub fn minutes_to_local[&v](z: &v Zone, utc: int) -> [] int {
+    return floor_div(to_local(z, utc * 60), 60);
+}

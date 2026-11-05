@@ -1,0 +1,142 @@
+edition 9;
+
+module tz_io;
+
+import std.buffer;
+import tz;
+
+// `tz_io` -- read a zone from the system's zoneinfo directory. `tz` itself takes bytes and holds no capability; this is
+// the file half, and the only place a zone NAME becomes a path.
+//
+// A zone name is untrusted (it comes from an API response, a design, a user), and it is joined to a directory, so it is
+// checked before it is: letters, digits and `_ + - /` only, 1 to 64 bytes, no empty or `.`-leading segment (so no `..`),
+// not starting or ending with '/'. `read_system_zone` takes a capability narrowed to /usr/share/zoneinfo, so even a bug
+// here could read nothing else. `read_zone_in` takes `Fs("")` and a directory, for a zoneinfo directory elsewhere (and for
+// the conformance run); its report is every file.
+
+pub fn r_bad_name() -> [] int {
+    return 0 - 940;
+}
+
+pub fn r_unreadable() -> [] int {
+    return 0 - 941;
+}
+
+// A zone file of 64 KiB or more: none is (the largest is a few KB); something else is being read.
+pub fn r_too_big() -> [] int {
+    return 0 - 942;
+}
+
+pub fn file_cap() -> [] int {
+    return 65536;
+}
+
+// Is `name` a zone name that may be joined to a directory?
+pub fn name_ok[&n](name: &n [byte]) -> [] bool {
+    if len(name) < 1 || len(name) > 64 {
+        return false;
+    }
+    if int_of(name[0]) == 47 || int_of(name[len(name) - 1]) == 47 {
+        return false;
+    }
+    var seg = 0;
+    var i = 0;
+    while i < len(name) {
+        let c = int_of(name[i]);
+        let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        if c == 47 {
+            if seg == 0 {
+                return false;
+            }
+            seg = 0;
+        } else if letter || digit || c == 95 || c == 43 || c == 45 {
+            seg = seg + 1;
+        } else if c == 46 && seg > 0 {
+            // A dot is allowed inside a segment (e.g. "Etc/GMT+1" has none, but "America/Port-au-Prince" etc. do not need
+            // one); a leading dot would make "." and ".." possible, so only a non-leading dot passes.
+            seg = seg + 1;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    return seg > 0;
+}
+
+// A zone that is nothing, for a refusal: the caller drops it like any other.
+fn nothing[&h](heap: &!h Heap) -> [heap] tz.Zone {
+    let (z, code) = tz.load(buffer.empty(heap, 1));
+    return z;
+}
+
+// The zone in the first `got` bytes of `scratch`, or a refusal.
+fn from_scratch[&h, &s](heap: &!h Heap, scratch: &s [byte], got: int) -> [heap] (tz.Zone, int) {
+    if got <= 0 {
+        return (nothing(heap), r_unreadable());
+    }
+    if got > file_cap() {
+        return (nothing(heap), r_too_big());
+    }
+    return tz.load(buffer.append(heap, buffer.empty(heap, got), scratch[0..got]));
+}
+
+// The path `dir` + "/" + `name`, in a buffer.
+fn joined[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of('/'));
+    return buffer.append(heap, b, name);
+}
+
+// Read the zone `name` from the zoneinfo directory `dir` (absolute, no trailing slash). Answers the zone and 0, or an
+// empty zone and a refusal (`r_bad_name`, `r_unreadable`, `r_too_big`, or one of `tz`'s for a file that is not a zone).
+pub fn read_zone_in[&h, &f, &d, &n](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte]) -> [heap, fs_read("")] (tz.Zone, int) {
+    if !name_ok(name) {
+        return (nothing(heap), r_bad_name());
+    }
+    let path = joined(heap, dir, name);
+    let scratch = box_slice(heap, file_cap() + 1, byte_of(0));
+    var got = 0;
+    borrow path as &pb in {
+        borrow mut scratch as &!sw in {
+            got = fs_read(fs, buffer.bytes(pb), contents(sw));
+        }
+    }
+    buffer.drop(heap, path);
+    var result = nothing(heap);
+    var code = 0;
+    borrow scratch as &sr in {
+        tz.drop(heap, result);
+        let (z, c) = from_scratch(heap, contents(sr), got);
+        result = z;
+        code = c;
+    }
+    unbox_slice(heap, scratch);
+    return (result, code);
+}
+
+// Read the zone `name` from /usr/share/zoneinfo, with a capability that can read nothing else.
+pub fn read_system_zone[&h, &f, &n](heap: &!h Heap, fs: &f Fs("/usr/share/zoneinfo"), name: &n [byte]) -> [heap, fs_read("/usr/share/zoneinfo")] (tz.Zone, int) {
+    if !name_ok(name) {
+        return (nothing(heap), r_bad_name());
+    }
+    let path = joined(heap, "/usr/share/zoneinfo", name);
+    let scratch = box_slice(heap, file_cap() + 1, byte_of(0));
+    var got = 0;
+    borrow path as &pb in {
+        borrow mut scratch as &!sw in {
+            got = fs_read(fs, buffer.bytes(pb), contents(sw));
+        }
+    }
+    buffer.drop(heap, path);
+    var result = nothing(heap);
+    var code = 0;
+    borrow scratch as &sr in {
+        tz.drop(heap, result);
+        let (z, c) = from_scratch(heap, contents(sr), got);
+        result = z;
+        code = c;
+    }
+    unbox_slice(heap, scratch);
+    return (result, code);
+}

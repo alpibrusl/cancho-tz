@@ -1,0 +1,785 @@
+import std.buffer;
+import std.bytes;
+import std.test;
+import tz;
+import tz_io;
+import zone_data;
+
+// Zones are real TZif files from tzdata 2026e, embedded as hex (tests/fixtures/zone_data.cho). Every expected number was
+// computed independently of this package: instants and offsets by CPython's zoneinfo reading the same files, calendar
+// facts by Python's datetime and a floor-division version of the civil-date algorithm. tests/conformance/zones_all.cho
+// checks the same against over half a million more instants.
+
+fn hex_value(c: int) -> [] int {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    return c - 97 + 10;
+}
+
+// The zone in `hex`, with the byte at `patch_at` set to `patch` (if `patch_at >= 0`) and the file cut to `cut_to` bytes
+// (if `cut_to >= 0`).
+fn zone_patched[&h, &x](heap: &!h Heap, hex: &x [byte], patch_at: int, patch: int, cut_to: int) -> [heap] (tz.Zone, int) {
+    let n = len(hex) / 2;
+    let raw = box_slice(heap, n, byte_of(0));
+    borrow mut raw as &!w in {
+        var i = 0;
+        while i < n {
+            contents(w)[i] = byte_of(hex_value(int_of(hex[2 * i])) * 16 + hex_value(int_of(hex[2 * i + 1])));
+            i = i + 1;
+        }
+        if patch_at >= 0 {
+            contents(w)[patch_at] = byte_of(patch);
+        }
+    }
+    var keep = n;
+    if cut_to >= 0 && cut_to < n {
+        keep = cut_to;
+    }
+    var out = buffer.empty(heap, keep + 1);
+    borrow raw as &r in {
+        out = buffer.append(heap, out, contents(r)[0..keep]);
+    }
+    unbox_slice(heap, raw);
+    return tz.load(out);
+}
+
+fn zone_of[&h, &x](heap: &!h Heap, hex: &x [byte]) -> [heap] tz.Zone {
+    let (z, code) = zone_patched(heap, hex, 0 - 1, 0, 0 - 1);
+    test.assert_eq(code, 0);
+    return z;
+}
+
+// The offset, daylight flag and abbreviation at instant `t` must be these.
+fn expect_at[&v, &n](z: &v tz.Zone, t: int, off: int, dst: int, name: &n [byte]) -> [] int {
+    let i = tz.info_at(z, t);
+    test.assert_eq(i.utoff, off);
+    test.assert_eq(i.isdst, dst);
+    test.assert(bytes.equal(tz.abbreviation(z, i), name));
+    return 0;
+}
+
+fn expect_local[&v](z: &v tz.Zone, local: int, kind: int, first: int, second: int) -> [] int {
+    let r = tz.local_to_utc(z, local);
+    test.assert_eq(r.kind, kind);
+    test.assert_eq(r.first, first);
+    test.assert_eq(r.second, second);
+    return 0;
+}
+
+// ---- the calendar --------------------------------------------------------------------------------------------------
+
+fn test_civil_dates_count_days_from_the_epoch() -> [] int {
+    test.assert_eq(tz.days_from_civil(1970, 1, 1), 0);
+    test.assert_eq(tz.days_from_civil(1969, 12, 31), 0 - 1);
+    test.assert_eq(tz.days_from_civil(2000, 2, 29), 11016);
+    test.assert_eq(tz.days_from_civil(2100, 3, 1), 47541);
+    test.assert_eq(tz.days_from_civil(1900, 1, 1), 0 - 25567);
+    test.assert_eq(tz.days_from_civil(1600, 1, 1), 0 - 135140);
+    test.assert_eq(tz.days_from_civil(2400, 2, 29), 157113);
+    test.assert_eq(tz.days_from_civil(1, 1, 1), 0 - 719162);
+    return 0;
+}
+
+// Years before 1: the proleptic Gregorian calendar has a year 0, and dates earlier than the epoch by a lot must not drift.
+fn test_years_before_one_are_exact() -> [] int {
+    test.assert_eq(tz.days_from_civil(0, 1, 1), 0 - 719528);
+    test.assert_eq(tz.days_from_civil(0, 3, 1), 0 - 719468);
+    test.assert_eq(tz.days_from_civil(0, 2, 29), 0 - 719469);
+    test.assert_eq(tz.days_from_civil(0 - 1, 12, 31), 0 - 719529);
+    test.assert_eq(tz.days_from_civil(0 - 400, 3, 1), 0 - 865565);
+    test.assert_eq(tz.days_from_civil(0 - 401, 2, 28), 0 - 865932);
+    test.assert_eq(tz.days_from_civil(0 - 100, 2, 28), 0 - 755994);
+    return 0;
+}
+
+fn test_the_year_of_a_day_inverts_it() -> [] int {
+    test.assert_eq(tz.year_of_days(0), 1970);
+    test.assert_eq(tz.year_of_days(0 - 1), 1969);
+    test.assert_eq(tz.year_of_days(20541), 2026);
+    test.assert_eq(tz.year_of_days(0 - 719528), 0);
+    test.assert_eq(tz.year_of_days(0 - 719529), 0 - 1);
+    test.assert_eq(tz.year_of_days(0 - 865565), 0 - 400);
+    // Every day boundary of a window that crosses the epoch, the leap day 2000, a century (2100) and year 0.
+    var y = 0 - 5;
+    while y <= 5 {
+        test.assert_eq(tz.year_of_days(tz.days_from_civil(y, 1, 1)), y);
+        test.assert_eq(tz.year_of_days(tz.days_from_civil(y, 12, 31)), y);
+        y = y + 1;
+    }
+    y = 1996;
+    while y <= 2004 {
+        test.assert_eq(tz.year_of_days(tz.days_from_civil(y, 1, 1)), y);
+        test.assert_eq(tz.year_of_days(tz.days_from_civil(y, 12, 31)), y);
+        test.assert_eq(tz.year_of_days(tz.days_from_civil(y, 1, 1) - 1), y - 1);
+        y = y + 1;
+    }
+    test.assert_eq(tz.year_of_days(tz.days_from_civil(2100, 3, 1) - 1), 2100);
+    return 0;
+}
+
+fn test_leap_years_and_month_lengths() -> [] int {
+    test.assert(tz.is_leap(2024));
+    test.assert(!tz.is_leap(2026));
+    test.assert(!tz.is_leap(1900));
+    test.assert(!tz.is_leap(2100));
+    test.assert(tz.is_leap(2000));
+    test.assert(tz.is_leap(2400));
+    test.assert_eq(tz.days_in_month(2024, 2), 29);
+    test.assert_eq(tz.days_in_month(2026, 2), 28);
+    test.assert_eq(tz.days_in_month(2100, 2), 28);
+    test.assert_eq(tz.days_in_month(2000, 2), 29);
+    test.assert_eq(tz.days_in_month(2026, 1), 31);
+    test.assert_eq(tz.days_in_month(2026, 4), 30);
+    test.assert_eq(tz.days_in_month(2026, 11), 30);
+    test.assert_eq(tz.days_in_month(2026, 12), 31);
+    return 0;
+}
+
+fn test_floor_division_rounds_down_even_below_zero() -> [] int {
+    test.assert_eq(tz.floor_div(7, 2), 3);
+    test.assert_eq(tz.floor_div(0 - 7, 2), 0 - 4);
+    test.assert_eq(tz.floor_div(0 - 6, 2), 0 - 3);
+    test.assert_eq(tz.floor_div(7, 0 - 2), 0 - 4);
+    test.assert_eq(tz.floor_div(0 - 1, 60), 0 - 1);
+    test.assert_eq(tz.floor_div(0 - 60, 60), 0 - 1);
+    test.assert_eq(tz.floor_div(0 - 61, 60), 0 - 2);
+    test.assert_eq(tz.floor_div(0, 60), 0);
+    return 0;
+}
+
+fn test_weekdays_and_the_nth_weekday_of_a_month() -> [] int {
+    // 1970-01-01 was a Thursday (4); 2026-03-29 a Sunday (0); 1969-12-31 a Wednesday (3).
+    test.assert_eq(tz.weekday_of_days(0), 4);
+    test.assert_eq(tz.weekday_of_days(20541), 0);
+    test.assert_eq(tz.weekday_of_days(0 - 1), 3);
+    test.assert_eq(tz.weekday_of_days(0 - 7), 4);
+    // The last Sunday of March 2026 is the 29th; of October 2026 the 25th; the first Sunday of November 2026 the 1st;
+    // the second Sunday of March 2026 the 8th.
+    test.assert_eq(tz.nth_weekday(2026, 3, 5, 0), 20541);
+    test.assert_eq(tz.nth_weekday(2026, 10, 5, 0), 20751);
+    test.assert_eq(tz.nth_weekday(2026, 11, 1, 0), 20758);
+    test.assert_eq(tz.nth_weekday(2026, 3, 2, 0), 20520);
+    // "Week 5" means the last one when the month has only four of that weekday: February 2026 has four Sundays, the
+    // last on the 22nd; February 2024 (a leap year) has five Thursdays... the last Thursday is the 29th.
+    test.assert_eq(tz.nth_weekday(2026, 2, 5, 0), 20506);
+    test.assert_eq(tz.nth_weekday(2024, 2, 5, 0), 19778);
+    test.assert_eq(tz.nth_weekday(2024, 2, 5, 4), 19782);
+    test.assert_eq(tz.nth_weekday(2000, 2, 5, 2), 11016);
+    test.assert_eq(tz.nth_weekday(2100, 2, 5, 0), 47540);
+    return 0;
+}
+
+// ---- Madrid: the everyday case --------------------------------------------------------------------------------------
+
+fn test_madrid_summer_and_winter[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        expect_at(v, 1768478400, 3600, 0, "CET");
+        expect_at(v, 1784116800, 7200, 1, "CEST");
+        test.assert_eq(tz.offset_at(v, 1768478400), 3600);
+        test.assert_eq(tz.to_local(v, 1768478400), 1768478400 + 3600);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+fn test_the_second_of_a_transition_is_exact[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        // 2026-03-29 01:00:00 UTC clocks go forward; 2026-10-25 01:00:00 UTC they go back.
+        expect_at(v, 1774745999, 3600, 0, "CET");
+        expect_at(v, 1774746000, 7200, 1, "CEST");
+        expect_at(v, 1792889999, 7200, 1, "CEST");
+        expect_at(v, 1792890000, 3600, 0, "CET");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// The file lists transitions to 2037; after that the rule string answers. 2040 and 2099 are rule dates.
+fn test_dates_beyond_the_file_use_the_rule[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        test.assert(tz.transition_at(v, tz.transitions(v) - 1) < 2224756800);
+        expect_at(v, 2224756800, 7200, 1, "CEST");
+        expect_at(v, 2237976000, 3600, 0, "CET");
+        expect_at(v, 4078468800, 7200, 1, "CEST");
+        // The rule's own transitions in 2050, to the second.
+        expect_at(v, 2531955600 - 1, 3600, 0, "CET");
+        expect_at(v, 2531955600, 7200, 1, "CEST");
+        expect_at(v, 2550704400 - 1, 7200, 1, "CEST");
+        expect_at(v, 2550704400, 3600, 0, "CET");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+fn test_before_the_first_transition_the_zone_is_local_mean_time[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        // Madrid kept local mean time (UTC-0:14:44) until 1901: an offset with seconds.
+        expect_at(v, 0 - 3786825600, 0 - 884, 0, "LMT");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// ---- a wall-clock time can happen twice or not at all --------------------------------------------------------------
+
+fn test_a_time_the_clocks_skip_is_a_gap[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        // 2026-03-29 02:30 never happened. Read with the offset before the jump (CET) it is 01:30 UTC; with the offset
+        // after (CEST), 00:30 UTC.
+        expect_local(v, 1774751400, tz.k_gap(), 1774747800, 1774744200);
+        // The last second before the gap and the first after it both exist, once.
+        expect_local(v, 1774749599, tz.k_unique(), 1774745999, 1774745999);
+        expect_local(v, 1774753200, tz.k_unique(), 1774746000, 1774746000);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+fn test_a_time_the_clocks_repeat_is_ambiguous[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        // 2026-10-25 02:30 happened twice: first in CEST (00:30 UTC), then in CET (01:30 UTC).
+        expect_local(v, 1792895400, tz.k_ambiguous(), 1792888200, 1792891800);
+        expect_local(v, 1792893599, tz.k_unique(), 1792886399, 1792886399);
+        expect_local(v, 1792897200, tz.k_unique(), 1792893600, 1792893600);
+        // An ordinary summer noon.
+        expect_local(v, 1780315200, tz.k_unique(), 1780308000, 1780308000);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+fn test_gaps_and_folds_also_come_from_the_rule[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        expect_local(v, 2216255400, tz.k_gap(), 2216251800, 2216248200);
+        expect_local(v, 2235004200, tz.k_ambiguous(), 2234997000, 2235000600);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+fn test_minutes_for_callers_that_count_minutes[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        // Summer noon local = 10:00 UTC, in minutes.
+        let r = tz.minutes_local_to_utc(v, 1780315200 / 60);
+        test.assert_eq(r.kind, tz.k_unique());
+        test.assert_eq(r.first, 1780308000 / 60);
+        test.assert_eq(tz.minutes_to_local(v, 1780308000 / 60), 1780315200 / 60);
+        // The gap and the fold survive the conversion.
+        let g = tz.minutes_local_to_utc(v, 1774751400 / 60);
+        test.assert_eq(g.kind, tz.k_gap());
+        test.assert_eq(g.first, 1774747800 / 60);
+        test.assert_eq(g.second, 1774744200 / 60);
+        let a = tz.minutes_local_to_utc(v, 1792895400 / 60);
+        test.assert_eq(a.kind, tz.k_ambiguous());
+        // An instant before the epoch: floor, not truncation.
+        test.assert_eq(tz.minutes_to_local(v, 0 - 1), 0 - 1 + 60);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// ---- zones that are not Madrid -------------------------------------------------------------------------------------
+
+fn test_new_york[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.america_new_york());
+    borrow z as &v in {
+        expect_at(v, 1772953199, 0 - 18000, 0, "EST");
+        expect_at(v, 1772953200, 0 - 14400, 1, "EDT");
+        expect_local(v, 1772937000, tz.k_gap(), 1772955000, 1772951400);
+        expect_local(v, 1793496600, tz.k_ambiguous(), 1793511000, 1793514600);
+        // The rule, 2045.
+        expect_at(v, 2372914800 - 1, 0 - 18000, 0, "EST");
+        expect_at(v, 2372914800, 0 - 14400, 1, "EDT");
+        expect_at(v, 2393474400 - 1, 0 - 14400, 1, "EDT");
+        expect_at(v, 2393474400, 0 - 18000, 0, "EST");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// A 30-minute daylight saving: the gap is half an hour, the offsets differ by 30 minutes.
+fn test_lord_howe_shifts_by_half_an_hour[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.australia_lord_howe());
+    borrow z as &v in {
+        expect_at(v, 1768435200, 39600, 1, "+11");
+        expect_at(v, 1784073600, 37800, 0, "+1030");
+        expect_local(v, 1791080100, tz.k_gap(), 1791042300, 1791040500);
+        expect_local(v, 1775353500, tz.k_ambiguous(), 1775313900, 1775315700);
+        // The gap is exactly the half hour: 02:00 is the first skipped minute and 02:30 the first that exists again.
+        expect_local(v, 1791079200 - 1, tz.k_unique(), 1791079200 - 1 - 37800, 1791079200 - 1 - 37800);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// Southern hemisphere: daylight time spans the new year, so the rule's start is later in the year than its end.
+fn test_sydney_is_in_daylight_time_over_new_year[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.australia_sydney());
+    borrow z as &v in {
+        expect_at(v, 1767225600, 39600, 1, "AEDT");
+        expect_at(v, 1782864000, 36000, 0, "AEST");
+        // 2060, in the rule's years: 23:30 UTC on 31 December is daylight time; the changes are to the second.
+        expect_at(v, 2871761400, 39600, 1, "AEDT");
+        expect_at(v, 2848233600 - 1, 39600, 1, "AEDT");
+        expect_at(v, 2848233600, 36000, 0, "AEST");
+        expect_at(v, 2863958400 - 1, 36000, 0, "AEST");
+        expect_at(v, 2863958400, 39600, 1, "AEDT");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+fn test_zones_without_daylight_time[&h](heap: &!h Heap) -> [heap] int {
+    let tokyo = zone_of(heap, zone_data.asia_tokyo());
+    borrow tokyo as &v in {
+        expect_at(v, 4083955200, 32400, 0, "JST");
+        expect_at(v, 0, 32400, 0, "JST");
+        test.assert_eq(v.rule.has_dst, 0);
+        test.assert_eq(v.rule.std_off, 32400);
+    }
+    tz.drop(heap, tokyo);
+    let kolkata = zone_of(heap, zone_data.asia_kolkata());
+    borrow kolkata as &w in {
+        expect_at(w, 1780272000, 19800, 0, "IST");
+        expect_local(w, 1780315200, tz.k_unique(), 1780295400, 1780295400);
+    }
+    tz.drop(heap, kolkata);
+    let utc = zone_of(heap, zone_data.utc());
+    borrow utc as &u in {
+        expect_at(u, 1782907200, 0, 0, "UTC");
+    }
+    tz.drop(heap, utc);
+    return 0;
+}
+
+fn test_dublin_and_lisbon_abbreviations[&h](heap: &!h Heap) -> [heap] int {
+    let dublin = zone_of(heap, zone_data.europe_dublin());
+    borrow dublin as &v in {
+        expect_at(v, 1782864000, 3600, 1, "IST");
+        expect_at(v, 1796083200, 0, 0, "GMT");
+    }
+    tz.drop(heap, dublin);
+    let lisbon = zone_of(heap, zone_data.europe_lisbon());
+    borrow lisbon as &w in {
+        expect_at(w, 1782907200, 3600, 1, "WEST");
+    }
+    tz.drop(heap, lisbon);
+    return 0;
+}
+
+// Greenland's rule starts at "-1": an hour BEFORE midnight on the last Sunday, i.e. on the Saturday evening.
+fn test_a_negative_rule_time_is_read[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.america_nuuk());
+    borrow z as &v in {
+        test.assert_eq(v.rule.std_off, 0 - 7200);
+        test.assert_eq(v.rule.dst_off, 0 - 3600);
+        test.assert_eq(v.rule.st, 0 - 3600);
+        test.assert_eq(v.rule.et, 0);
+        test.assert_eq(v.rule.sm, 3);
+        test.assert_eq(v.rule.sw, 5);
+        test.assert_eq(v.rule.sd, 0);
+        // In the file's years.
+        expect_at(v, 1774746000 - 1, 0 - 7200, 0, "-02");
+        expect_at(v, 1774746000, 0 - 3600, 1, "-01");
+        expect_at(v, 1792890000 - 1, 0 - 3600, 1, "-01");
+        expect_at(v, 1792890000, 0 - 7200, 0, "-02");
+        // And in the rule's years (2050): the same instants of the year, from the rule alone.
+        expect_at(v, 2531955600 - 1, 0 - 7200, 0, "-02");
+        expect_at(v, 2531955600, 0 - 3600, 1, "-01");
+        expect_at(v, 2550704400 - 1, 0 - 3600, 1, "-01");
+        expect_at(v, 2550704400, 0 - 7200, 0, "-02");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+fn test_the_rule_string_is_read_into_its_parts[&h](heap: &!h Heap) -> [heap] int {
+    let madrid = zone_of(heap, zone_data.europe_madrid());
+    borrow madrid as &v in {
+        // CET-1CEST,M3.5.0,M10.5.0/3
+        test.assert_eq(v.rule.present, 1);
+        test.assert_eq(v.rule.has_dst, 1);
+        test.assert_eq(v.rule.std_off, 3600);
+        test.assert_eq(v.rule.dst_off, 7200);
+        test.assert_eq(v.rule.sm, 3);
+        test.assert_eq(v.rule.sw, 5);
+        test.assert_eq(v.rule.sd, 0);
+        // No time given: 02:00 is the default.
+        test.assert_eq(v.rule.st, 7200);
+        test.assert_eq(v.rule.em, 10);
+        test.assert_eq(v.rule.et, 10800);
+    }
+    tz.drop(heap, madrid);
+    // <+1030>-10:30<+11>-11,M10.1.0,M4.1.0: names in angle brackets, an offset with minutes, an explicit daylight offset.
+    let lh = zone_of(heap, zone_data.australia_lord_howe());
+    borrow lh as &w in {
+        test.assert_eq(w.rule.std_off, 37800);
+        test.assert_eq(w.rule.dst_off, 39600);
+        test.assert_eq(w.rule.sm, 10);
+        test.assert_eq(w.rule.sw, 1);
+        test.assert_eq(w.rule.em, 4);
+        test.assert_eq(w.rule.std_name_len, 5);
+        test.assert_eq(w.rule.dst_name_len, 3);
+    }
+    tz.drop(heap, lh);
+    return 0;
+}
+
+// Morocco suspends daylight time for Ramadan, so its offset changes three times in 2026 and the file lists them.
+fn test_casablanca_changes_offset_for_ramadan[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.africa_casablanca());
+    borrow z as &v in {
+        expect_at(v, 1771588800, 0, 0, "+00");
+        expect_at(v, 1781956800, 3600, 1, "+01");
+        expect_at(v, 1771120800 - 1, 3600, 1, "+01");
+        expect_at(v, 1771120800, 0, 0, "+00");
+        expect_at(v, 1774144800 - 1, 0, 0, "+00");
+        expect_at(v, 1774144800, 3600, 1, "+01");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// Samoa skipped 30 December 2011: the offset went from UTC-10 to UTC+14, so a whole calendar day never happened.
+fn test_samoa_skipped_a_whole_day[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.pacific_apia());
+    borrow z as &v in {
+        expect_at(v, 1325239200 - 1, 0 - 36000, 1, "-10");
+        expect_at(v, 1325239200, 50400, 1, "+14");
+        expect_local(v, 1325246400, tz.k_gap(), 1325282400, 1325196000);
+        expect_local(v, 1325332800, tz.k_unique(), 1325282400, 1325282400);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// ---- a file that is not a good zone is refused, not guessed at ------------------------------------------------------
+
+fn code_of[&h, &x](heap: &!h Heap, hex: &x [byte], patch_at: int, patch: int, cut_to: int) -> [heap] int {
+    let (z, code) = zone_patched(heap, hex, patch_at, patch, cut_to);
+    tz.drop(heap, z);
+    return code;
+}
+
+fn test_a_file_that_is_not_a_zone_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    let madrid = zone_data.europe_madrid();
+    // Too short to be anything; the wrong first byte; a version 1 file (version byte 0), which has no rule string.
+    test.assert_eq(code_of(heap, madrid, 0 - 1, 0, 10), tz.r_not_tzif());
+    test.assert_eq(code_of(heap, madrid, 0 - 1, 0, 0), tz.r_not_tzif());
+    test.assert_eq(code_of(heap, madrid, 0, 88, 0 - 1), tz.r_not_tzif());
+    test.assert_eq(code_of(heap, madrid, 4, 0, 0 - 1), tz.r_old_version());
+    // Cut in the middle of the version 1 block, and in the middle of the version 2 data.
+    test.assert_eq(code_of(heap, madrid, 0 - 1, 0, 100), tz.r_truncated());
+    test.assert_eq(code_of(heap, madrid, 0 - 1, 0, 1500), tz.r_truncated());
+    // A good file is accepted.
+    test.assert_eq(code_of(heap, madrid, 0 - 1, 0, 0 - 1), 0);
+    return 0;
+}
+
+fn test_a_table_index_outside_its_table_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    // Find where the version 2 transition type indexes start, and point one outside the table of local time types.
+    let z = zone_of(heap, zone_data.europe_madrid());
+    var at = 0;
+    borrow z as &v in {
+        at = v.p_idx;
+    }
+    tz.drop(heap, z);
+    test.assert(at > 44);
+    test.assert_eq(code_of(heap, zone_data.europe_madrid(), at, 250, 0 - 1), tz.r_bad_counts());
+    test.assert_eq(code_of(heap, zone_data.europe_madrid(), at + 5, 250, 0 - 1), tz.r_bad_counts());
+    return 0;
+}
+
+fn test_a_rule_that_is_malformed_or_unsupported_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    // The footer of Madrid's file is "\nCET-1CEST,M3.5.0,M10.5.0/3\n": 28 bytes from the end.
+    let madrid = zone_data.europe_madrid();
+    let size = len(madrid) / 2;
+    // "/3" becomes "Q3": the end date has trailing junk.
+    test.assert_eq(code_of(heap, madrid, size - 3, 81, 0 - 1), tz.r_bad_rule());
+    // The start date's 'M' becomes 'J' (a Julian day, a form this package does not read).
+    test.assert_eq(code_of(heap, madrid, size - 27 + 10, 74, 0 - 1), tz.r_bad_rule());
+    // The first footer byte is not a newline.
+    test.assert_eq(code_of(heap, madrid, size - 28, 88, 0 - 1), tz.r_bad_rule());
+    // The start date's month becomes 0 ("M0.5.0"): not a month.
+    test.assert_eq(code_of(heap, madrid, size - 27 + 11, 48, 0 - 1), tz.r_bad_rule());
+    // And January ("M1.5.0") is a fine month, so patching the digit to 1 is accepted: the refusals above are about the
+    // rule's content, not about the file having been touched.
+    test.assert_eq(code_of(heap, madrid, size - 27 + 11, 49, 0 - 1), 0);
+    return 0;
+}
+
+// ---- zone names are untrusted --------------------------------------------------------------------------------------
+
+fn test_zone_names_that_may_be_joined_to_a_directory() -> [] int {
+    test.assert(tz_io.name_ok("UTC"));
+    test.assert(tz_io.name_ok("Europe/Madrid"));
+    test.assert(tz_io.name_ok("America/Port-au-Prince"));
+    test.assert(tz_io.name_ok("Etc/GMT+5"));
+    test.assert(tz_io.name_ok("America/Argentina/Buenos_Aires"));
+    test.assert(tz_io.name_ok("a.b"));
+    return 0;
+}
+
+fn test_zone_names_that_escape_are_refused() -> [] int {
+    test.assert(!tz_io.name_ok(""));
+    test.assert(!tz_io.name_ok("/etc/passwd"));
+    test.assert(!tz_io.name_ok("../etc/passwd"));
+    test.assert(!tz_io.name_ok("Europe/../../etc/passwd"));
+    test.assert(!tz_io.name_ok(".."));
+    test.assert(!tz_io.name_ok("."));
+    test.assert(!tz_io.name_ok("Europe/.."));
+    test.assert(!tz_io.name_ok("Europe/."));
+    test.assert(!tz_io.name_ok(".hidden"));
+    test.assert(!tz_io.name_ok("Europe//Madrid"));
+    test.assert(!tz_io.name_ok("Europe/"));
+    test.assert(!tz_io.name_ok("Europe/Mad rid"));
+    test.assert(!tz_io.name_ok("Europe\\Madrid"));
+    test.assert(!tz_io.name_ok("Europe/Madrid\0"));
+    test.assert(!tz_io.name_ok("Europe/Madrí"));
+    test.assert(!tz_io.name_ok("Europe/Madrid?x"));
+    test.assert(!tz_io.name_ok("a;b"));
+    return 0;
+}
+
+fn test_a_name_is_at_most_64_bytes() -> [] int {
+    test.assert(tz_io.name_ok("0123456789012345678901234567890123456789012345678901234567890123"));
+    test.assert(!tz_io.name_ok("01234567890123456789012345678901234567890123456789012345678901234"));
+    return 0;
+}
+
+// ---- more of the file format ---------------------------------------------------------------------------------------
+
+// Madrid's file with its rule string (the last line) replaced by `footer`: the transitions are Madrid's, so a date after
+// 2037 is answered by `footer` alone.
+fn zone_with_footer[&h, &x, &f](heap: &!h Heap, hex: &x [byte], footer: &f [byte]) -> [heap] (tz.Zone, int) {
+    let n = len(hex) / 2;
+    let raw = box_slice(heap, n, byte_of(0));
+    borrow mut raw as &!w in {
+        var i = 0;
+        while i < n {
+            contents(w)[i] = byte_of(hex_value(int_of(hex[2 * i])) * 16 + hex_value(int_of(hex[2 * i + 1])));
+            i = i + 1;
+        }
+    }
+    // The file ends "\nCET-1CEST,M3.5.0,M10.5.0/3\n": keep everything up to and including the newline before the rule.
+    var out = buffer.empty(heap, n);
+    borrow raw as &r in {
+        out = buffer.append(heap, out, contents(r)[0..n - 27]);
+    }
+    unbox_slice(heap, raw);
+    out = buffer.append(heap, out, footer);
+    out = buffer.push(heap, out, byte_of(10));
+    return tz.load(out);
+}
+
+fn footer_code[&h, &f](heap: &!h Heap, footer: &f [byte]) -> [heap] int {
+    let (z, code) = zone_with_footer(heap, zone_data.europe_madrid(), footer);
+    tz.drop(heap, z);
+    return code;
+}
+
+fn test_the_transitions_in_a_file_are_read_in_full_64_bits[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        test.assert_eq(tz.transitions(v), 162);
+        // Before 1970 (negative), in the 1980s, and after 2038 (bit 31 of the low half set): all from the same file by Python.
+        test.assert_eq(tz.transition_at(v, 0), 0 - 2177452800);
+        test.assert_eq(tz.transition_at(v, 10), 0 - 1333324800);
+        test.assert_eq(tz.transition_at(v, 50), 386125200);
+        test.assert_eq(tz.transition_at(v, 161), 2140045200);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// The file's last transition is in October 2037; the rule takes over from there, and March 2038 is the first rule date.
+fn test_the_rule_takes_over_right_after_the_last_transition[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        expect_at(v, 2143281600, 3600, 0, "CET");
+        expect_at(v, 2148638400, 3600, 0, "CET");
+        expect_at(v, 2161598400, 7200, 1, "CEST");
+        expect_at(v, 2173435200, 3600, 0, "CET");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// Instants and local times before the epoch, in a zone whose offset has seconds: minutes round DOWN, not toward zero.
+fn test_negative_minutes_round_down[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.europe_madrid());
+    borrow z as &v in {
+        test.assert_eq(tz.minutes_to_local(v, 0 - 63113904), 0 - 63113919);
+        let r = tz.minutes_local_to_utc(v, 0 - 63113900);
+        test.assert_eq(r.kind, tz.k_unique());
+        test.assert_eq(r.first, 0 - 63113886);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+fn test_an_abbreviation_index_outside_the_characters_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    // The first local time type's abbreviation index (byte 5 of its 6) points past the abbreviation characters.
+    test.assert_eq(code_of(heap, zone_data.europe_madrid(), 2471 + 5, 250, 0 - 1), tz.r_bad_counts());
+    return 0;
+}
+
+// Leap-second records are part of the file but not of POSIX time: they are stepped over, and the answers are Madrid's.
+fn test_leap_second_records_are_skipped_not_applied[&h](heap: &!h Heap) -> [heap] int {
+    let z = zone_of(heap, zone_data.madrid_with_leap_records());
+    borrow z as &v in {
+        test.assert_eq(tz.transitions(v), 162);
+        expect_at(v, 1768478400, 3600, 0, "CET");
+        expect_at(v, 1784116800, 7200, 1, "CEST");
+        expect_at(v, 1774745999, 3600, 0, "CET");
+        expect_at(v, 1774746000, 7200, 1, "CEST");
+        expect_at(v, 2224756800, 7200, 1, "CEST");
+        expect_local(v, 1774751400, tz.k_gap(), 1774747800, 1774744200);
+        test.assert_eq(v.rule.std_off, 3600);
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// ---- the rule string, in every form tzdata uses and a few it does not ------------------------------------------------
+
+fn test_rule_times_may_be_negative_or_longer_than_a_day[&h](heap: &!h Heap) -> [heap] int {
+    let (a, ca) = zone_with_footer(heap, zone_data.europe_madrid(), "CET-1CEST,M3.5.0/167,M10.5.0");
+    test.assert_eq(ca, 0);
+    borrow a as &av in {
+        test.assert_eq(av.rule.st, 601200);
+        // No end time: 02:00.
+        test.assert_eq(av.rule.et, 7200);
+    }
+    tz.drop(heap, a);
+    let (b, cb) = zone_with_footer(heap, zone_data.europe_madrid(), "CET-1CEST,M3.5.0/2:30:15,M10.5.0/-2:30");
+    test.assert_eq(cb, 0);
+    borrow b as &bv in {
+        test.assert_eq(bv.rule.st, 9015);
+        test.assert_eq(bv.rule.et, 0 - 9000);
+    }
+    tz.drop(heap, b);
+    let (c, cc) = zone_with_footer(heap, zone_data.europe_madrid(), "CET-1CEST,M3.5.0/+3,M10.5.0/0");
+    test.assert_eq(cc, 0);
+    borrow c as &cv in {
+        test.assert_eq(cv.rule.st, 10800);
+        test.assert_eq(cv.rule.et, 0);
+    }
+    tz.drop(heap, c);
+    return 0;
+}
+
+fn test_rule_offsets_may_have_minutes_and_the_daylight_one_may_be_given[&h](heap: &!h Heap) -> [heap] int {
+    let (a, ca) = zone_with_footer(heap, zone_data.europe_madrid(), "CET-1:30CEST,M3.5.0,M10.5.0");
+    test.assert_eq(ca, 0);
+    borrow a as &av in {
+        test.assert_eq(av.rule.std_off, 5400);
+        // No daylight offset given: an hour more than standard.
+        test.assert_eq(av.rule.dst_off, 9000);
+    }
+    tz.drop(heap, a);
+    let (b, cb) = zone_with_footer(heap, zone_data.europe_madrid(), "CET-1CEST-3,M3.5.0,M10.5.0");
+    test.assert_eq(cb, 0);
+    borrow b as &bv in {
+        test.assert_eq(bv.rule.dst_off, 10800);
+    }
+    tz.drop(heap, b);
+    // West of Greenwich the sign is the other way: EST5 is UTC-5.
+    let (c, cc) = zone_with_footer(heap, zone_data.europe_madrid(), "EST5EDT,M3.2.0,M11.1.0");
+    test.assert_eq(cc, 0);
+    borrow c as &cv in {
+        test.assert_eq(cv.rule.std_off, 0 - 18000);
+        test.assert_eq(cv.rule.dst_off, 0 - 14400);
+    }
+    tz.drop(heap, c);
+    return 0;
+}
+
+fn test_a_malformed_rule_is_refused_in_each_part[&h](heap: &!h Heap) -> [heap] int {
+    // Hours past 167, minutes past 59.
+    test.assert_eq(footer_code(heap, "CET-1CEST,M3.5.0/168,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-168CEST,M3.5.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1:60CEST,M3.5.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,M3.5.0/1:75,M10.5.0"), tz.r_bad_rule());
+    // The date: month 0 and 13, week 0 and 6, weekday 7, a missing weekday.
+    test.assert_eq(footer_code(heap, "CET-1CEST,M0.5.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,M13.5.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,M3.0.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,M3.6.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,M3.5.7,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,M3.5,M10.5.0"), tz.r_bad_rule());
+    // Julian-day and day-of-year forms are not supported, whatever they mean.
+    test.assert_eq(footer_code(heap, "CET-1CEST,J60,J300"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,60,300"), tz.r_bad_rule());
+    // Names: too short, an unclosed or empty <...>.
+    test.assert_eq(footer_code(heap, "CE-1CEST,M3.5.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CE,M3.5.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "<CET-1CEST,M3.5.0,M10.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "<>-1CEST,M3.5.0,M10.5.0"), tz.r_bad_rule());
+    // Structure: a daylight name with no dates, one date only, nothing after the offset but junk, trailing junk.
+    test.assert_eq(footer_code(heap, "CET-1CEST"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,M3.5.0"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1X"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET-1CEST,M3.5.0,M10.5.0,M1.1.1"), tz.r_bad_rule());
+    test.assert_eq(footer_code(heap, "CET"), tz.r_bad_rule());
+    // And the plain ones are accepted: a fixed zone, one with <> names, and no rule at all.
+    test.assert_eq(footer_code(heap, "CET-1"), 0);
+    test.assert_eq(footer_code(heap, "<+01>-1"), 0);
+    test.assert_eq(footer_code(heap, ""), 0);
+    return 0;
+}
+
+// With no rule at all the last transition's local time type stays in force forever (no summer time after 2037).
+fn test_a_file_without_a_rule_keeps_its_last_type[&h](heap: &!h Heap) -> [heap] int {
+    let (z, code) = zone_with_footer(heap, zone_data.europe_madrid(), "");
+    test.assert_eq(code, 0);
+    borrow z as &v in {
+        test.assert_eq(v.rule.present, 0);
+        expect_at(v, 2540000000, 3600, 0, "CET");
+        expect_at(v, 2552000000, 3600, 0, "CET");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// A rule that moves the hour by more than a day: "/26" means 02:00 the NEXT day, so the change falls on the Monday.
+fn test_a_rule_time_past_midnight_moves_the_day[&h](heap: &!h Heap) -> [heap] int {
+    let (z, code) = zone_with_footer(heap, zone_data.europe_madrid(), "CET-1CEST,M3.5.0/26,M10.5.0/3");
+    test.assert_eq(code, 0);
+    borrow z as &v in {
+        // 2050: forward at 2050-03-28 01:00 UTC (Monday 02:00 CET), back at 2050-10-30 01:00 UTC (03:00 CEST).
+        expect_at(v, 2532042000 - 1, 3600, 0, "CET");
+        expect_at(v, 2532042000, 7200, 1, "CEST");
+        expect_at(v, 2550704400 - 1, 7200, 1, "CEST");
+        expect_at(v, 2550704400, 3600, 0, "CET");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
+
+// A made-up southern rule over the same file: daylight time from the first Sunday in October to the first in April.
+fn test_a_southern_rule_is_in_daylight_time_at_the_new_year[&h](heap: &!h Heap) -> [heap] int {
+    let (z, code) = zone_with_footer(heap, zone_data.europe_madrid(), "AET-10AEDT,M10.1.0,M4.1.0/3");
+    test.assert_eq(code, 0);
+    borrow z as &v in {
+        test.assert_eq(v.rule.std_off, 36000);
+        test.assert_eq(v.rule.dst_off, 39600);
+        // 2050-01-01 is in daylight time; it ends at 2050-04-02 16:00 UTC and returns at 2050-10-01 16:00 UTC.
+        expect_at(v, 2524608000, 39600, 1, "AEDT");
+        expect_at(v, 2532528000 - 1, 39600, 1, "AEDT");
+        expect_at(v, 2532528000, 36000, 0, "AET");
+        expect_at(v, 2548252800 - 1, 36000, 0, "AET");
+        expect_at(v, 2548252800, 39600, 1, "AEDT");
+    }
+    tz.drop(heap, z);
+    return 0;
+}
