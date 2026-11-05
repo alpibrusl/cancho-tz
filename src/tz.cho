@@ -120,6 +120,29 @@ pub fn year_of_days(days: int) -> [] int {
     return year;
 }
 
+// The civil date (year, month, day) of epoch day `days`: the inverse of `days_from_civil`, exact for any day.
+pub fn civil_of_days(days: int) -> [] (int, int, int) {
+    let z = days + 719468;
+    var era = z / 146097;
+    if z < 0 && z % 146097 != 0 {
+        era = era - 1;
+    }
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    var month = mp + 3;
+    if mp >= 10 {
+        month = mp - 9;
+    }
+    var year = yoe + era * 400;
+    if month <= 2 {
+        year = year + 1;
+    }
+    return (year, month, day);
+}
+
 pub fn is_leap(y: int) -> [] bool {
     return y % 4 == 0 && y % 100 != 0 || y % 400 == 0;
 }

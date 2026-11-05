@@ -783,3 +783,77 @@ fn test_a_southern_rule_is_in_daylight_time_at_the_new_year[&h](heap: &!h Heap) 
     tz.drop(heap, z);
     return 0;
 }
+
+// ---- the calendar, backwards ------------------------------------------------------------------------------------------------
+
+fn test_an_epoch_day_is_a_calendar_date_again() -> [] int {
+    let (y0, m0, d0) = tz.civil_of_days(0);
+    test.assert_eq(y0, 1970);
+    test.assert_eq(m0, 1);
+    test.assert_eq(d0, 1);
+    let (y1, m1, d1) = tz.civil_of_days(0 - 1);
+    test.assert_eq(y1, 1969);
+    test.assert_eq(m1, 12);
+    test.assert_eq(d1, 31);
+    // 2026-12-10 is day 20797, and the leap day and the century that is not one.
+    let (y2, m2, d2) = tz.civil_of_days(20797);
+    test.assert_eq(y2, 2026);
+    test.assert_eq(m2, 12);
+    test.assert_eq(d2, 10);
+    let (y3, m3, d3) = tz.civil_of_days(11016);
+    test.assert_eq(y3, 2000);
+    test.assert_eq(m3, 2);
+    test.assert_eq(d3, 29);
+    let (y4, m4, d4) = tz.civil_of_days(47541);
+    test.assert_eq(y4, 2100);
+    test.assert_eq(m4, 3);
+    test.assert_eq(d4, 1);
+    let (y5, m5, d5) = tz.civil_of_days(47540);
+    test.assert_eq(y5, 2100);
+    test.assert_eq(m5, 2);
+    test.assert_eq(d5, 28);
+    return 0;
+}
+
+// Before year 1, where floor division matters.
+fn test_the_inverse_is_exact_before_the_epoch_and_before_year_one() -> [] int {
+    let (y0, m0, d0) = tz.civil_of_days(0 - 719528);
+    test.assert_eq(y0, 0);
+    test.assert_eq(m0, 1);
+    test.assert_eq(d0, 1);
+    let (y1, m1, d1) = tz.civil_of_days(0 - 719469);
+    test.assert_eq(y1, 0);
+    test.assert_eq(m1, 2);
+    test.assert_eq(d1, 29);
+    let (y2, m2, d2) = tz.civil_of_days(0 - 865565);
+    test.assert_eq(y2, 0 - 400);
+    test.assert_eq(m2, 3);
+    test.assert_eq(d2, 1);
+    return 0;
+}
+
+// Round trip over a long run of days that crosses the epoch, year 0, several leap years and a non-leap century.
+fn test_every_day_goes_forward_and_back() -> [] int {
+    var days = 0 - 800000;
+    while days <= 200000 {
+        let (y, m, d) = tz.civil_of_days(days);
+        test.assert_eq(tz.days_from_civil(y, m, d), days);
+        test.assert(m >= 1 && m <= 12);
+        test.assert(d >= 1 && d <= tz.days_in_month(y, m));
+        days = days + 97;
+    }
+    // And every day of a leap year and of the year around the epoch, without skipping any.
+    var k = tz.days_from_civil(2024, 1, 1);
+    while k < tz.days_from_civil(2025, 1, 1) {
+        let (y, m, d) = tz.civil_of_days(k);
+        test.assert_eq(tz.days_from_civil(y, m, d), k);
+        k = k + 1;
+    }
+    var j = tz.days_from_civil(1969, 1, 1);
+    while j < tz.days_from_civil(1971, 1, 1) {
+        let (y, m, d) = tz.civil_of_days(j);
+        test.assert_eq(tz.days_from_civil(y, m, d), j);
+        j = j + 1;
+    }
+    return 0;
+}

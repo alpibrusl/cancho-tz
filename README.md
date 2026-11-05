@@ -2,7 +2,7 @@
 
 IANA time zones for [cancho](https://github.com/alpibrusl/cancho): what is the offset from UTC in this zone at this instant, and **what instant is this wall-clock time in this zone**, which is not a function, because a clock time can happen twice (clocks go back) or never (they jump forward). No capability, no foreign code.
 
-**Status: alpha.** `src/tz.cho` (the pure core), `src/tz_io.cho` (reading the system zoneinfo), 40 unit tests, and a conformance run of **537,088 instants over all 345 distinct zones in tzdata 2026e with zero disagreements** against CPython's `zoneinfo`.
+**Status: alpha.** `src/tz.cho` (the pure core), `src/tz_io.cho` (reading the system zoneinfo), 43 unit tests, and a conformance run of **537,088 instants over all 345 distinct zones in tzdata 2026e with zero disagreements** against CPython's `zoneinfo`.
 
 ```cancho
 let (zone, code) = tz_io.read_system_zone(heap, fs, "Europe/Madrid");   // fs: Fs("/usr/share/zoneinfo"), nothing else
@@ -25,7 +25,7 @@ borrow zone as &z in {
 * **`info_at(z, t)`**: offset, daylight flag and abbreviation at instant `t` (seconds). Binary search over the file's explicit transitions; **after the last one the POSIX rule string at the end of the file answers** (`CET-1CEST,M3.5.0,M10.5.0/3`), which is what a date in 2040 uses.
 * **`local_to_utc(z, local)`** answers `k_unique`, `k_ambiguous` or `k_gap` with the two readings; **`minutes_*`** for callers that count minutes (floor division, exact below zero).
 * **`tz_io`** reads a zone by name. Names are untrusted: `[A-Za-z0-9_+-/.]`, 1 to 64 bytes, no empty or `.`-leading segment, so `..` cannot occur. `read_system_zone` takes a capability narrowed to `/usr/share/zoneinfo`.
-* Pure functions on the calendar (`days_from_civil`, `year_of_days`, `nth_weekday`, ...) are exported and exact for any year, negative ones included.
+* Pure functions on the calendar (`days_from_civil`, `civil_of_days`, `year_of_days`, `nth_weekday`, ...) are exported and exact for any year, negative ones included.
 
 ## What it does not do
 
@@ -39,7 +39,7 @@ borrow zone as &z in {
 ## Test
 
 ```sh
-CANCHO=/path/to/cancho scripts/test.sh            # 40 unit tests, real zone files embedded as hex
+CANCHO=/path/to/cancho scripts/test.sh            # 43 unit tests, real zone files embedded as hex
 CANCHO=/path/to/cancho scripts/conformance.sh     # all zones vs CPython zoneinfo (python3 is the oracle only)
 ```
 
